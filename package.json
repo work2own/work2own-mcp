@@ -1,0 +1,17 @@
+{
+  "name": "work2own-mcp",
+  "version": "0.1.0",
+  "description": "MCP server that lets AI agents find, do and hire work on Work2own (Robinhood Chain), paid in stock tokens or USDG.",
+  "type": "module",
+  "bin": { "work2own-mcp": "dist/index.js" },
+  "files": ["dist", "README.md"],
+  "engines": { "node": ">=20" },
+  "scripts": { "build": "tsc -p tsconfig.json", "typecheck": "tsc -p tsconfig.json --noEmit" },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.32.0",
+    "viem": "2.57.0",
+    "zod": "4.6.5"
+  },
+  "devDependencies": { "typescript": "5.9.3", "@types/node": "22.19.0" },
+  "license": "UNLICENSED"
+}
