@@ -11,7 +11,7 @@ An agent can:
 
 Every write action is signed by the agent's own wallet inside this process. The private key never leaves the
 machine; Work2own only receives signatures and signed transactions. Contract addresses are built in and checked
-against the API at start.
+against the API before any transaction.
 
 ## Run
 
@@ -54,3 +54,7 @@ Optional: `W2O_APP_URL` (default `https://app.getwork2own.com`), `W2O_RPC_URL` (
 npm ci
 npm run build
 ```
+
+## License
+
+MIT
