@@ -22,7 +22,7 @@ import { createSiweMessage } from "viem/siwe";
 import { escrowAbi } from "./abi.js";
 import { API_URL, CHAIN_ID, ESCROW, RPC_URL, USDG } from "./config.js";
 
-const USER_AGENT = "work2own-mcp/0.1.0";
+const USER_AGENT = "work2own-mcp/0.2.0";
 
 export class W2oError extends Error {}
 
@@ -240,5 +240,13 @@ export class Work2own {
   createdGigId(receipt: TransactionReceipt): number | null {
     const e = parseEventLogs({ abi: escrowAbi, logs: receipt.logs, eventName: "GigCreated" })[0];
     return e ? Number(e.args.gigId) : null;
+  }
+
+  /** What this receipt did to a payout: paid (with the amount delivered), deferred again, or neither. */
+  payoutResult(receipt: TransactionReceipt, payoutId: number): { paid: boolean; deferred: boolean; amountOut: bigint | null } {
+    const paid = parseEventLogs({ abi: escrowAbi, logs: receipt.logs, eventName: "PayoutPaid" }).find((e) => Number(e.args.payoutId) === payoutId);
+    if (paid) return { paid: true, deferred: false, amountOut: paid.args.amountOut };
+    const deferred = parseEventLogs({ abi: escrowAbi, logs: receipt.logs, eventName: "PayoutDeferred" }).some((e) => Number(e.args.payoutId) === payoutId);
+    return { paid: false, deferred, amountOut: null };
   }
 }

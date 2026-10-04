@@ -9,7 +9,7 @@ import { Work2own } from "./w2o.js";
 
 const w2o = new Work2own(process.env.W2O_PRIVATE_KEY);
 const server = new McpServer(
-  { name: "work2own", version: "0.1.0" },
+  { name: "work2own", version: "0.2.0" },
   {
     instructions:
       "Work2own is a work marketplace on Robinhood Chain where people and AI agents earn stock tokens (or USDG) for quests and gigs, " +

@@ -1,7 +1,7 @@
 // The Work2own tools an AI agent can call: find work, do quests and gigs, and hire people or other agents.
 
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { formatUnits, getAddress, isAddress, parseUnits, type Address, type Hex } from "viem";
+import { formatUnits, getAddress, isAddress, parseUnits, type Address, type Hex, type TransactionReceipt } from "viem";
 import { z } from "zod";
 import { APP_URL, BPS, ESCROW, REVIEW_WINDOW, STOCK_DECIMALS, USDG_DECIMALS, USDG_PAYOUT } from "./config.js";
 import { errorText, W2oError, type Work2own } from "./w2o.js";
@@ -30,6 +30,21 @@ type Campaign = {
 };
 type Claim = { worker: string; status: string; payoutToken: string; reservationEndsAt: number; submittedAt: number | null; reviewEndsAt: number | null; proof: unknown; payoutId: number | null };
 type Listing = { id: number; employer: string; employerName: string | null; title: string; description: string; links: string[]; budget: string; deliveryDays: number; status: string; applicants: number; createdAt: number; gigId: number | null };
+type Payout = {
+  id: number;
+  worker: string;
+  payoutToken: string;
+  amount: string;
+  status: string;
+  createdAt: number;
+  canChangeTokenAt: number;
+  source: { kind: string; id: number } | null;
+  amountOut: string | null;
+  paidAt: number | null;
+  paidTx: string | null;
+  deferredCount: number;
+  lastDeferredReason: string | null;
+};
 
 /** Exact USDG amount with at least 2 decimals, e.g. "0.10 USDG" or "0.002 USDG". */
 const usdg = (units: string | bigint) => {
@@ -37,7 +52,7 @@ const usdg = (units: string | bigint) => {
   return `${whole}.${frac.padEnd(2, "0")} USDG`;
 };
 /** Fields of API answers that hold USDG base units. */
-const USDG_FIELDS = new Set(["rewardPerSlot", "budget", "fee", "earnedUsdg", "workerAmount", "employerRefund"]);
+const USDG_FIELDS = new Set(["rewardPerSlot", "budget", "fee", "earnedUsdg", "workerAmount", "employerRefund", "refund"]);
 const toUnits = (amount: string) => {
   if (!/^\d+(\.\d{1,6})?$/.test(amount.trim())) throw new W2oError("amounts are USDG with up to 6 decimals, for example 10 or 2.5");
   const units = parseUnits(amount.trim(), USDG_DECIMALS);
@@ -73,6 +88,26 @@ function questSummary(c: Campaign) {
   };
 }
 
+/** One payout in readable form; `symbols` maps lowercase token addresses to symbols. */
+function payoutSummary(p: Payout, symbols: Map<string, string>) {
+  const isUsdg = p.payoutToken.toLowerCase() === USDG_PAYOUT.toLowerCase();
+  const symbol = isUsdg ? "USDG" : (symbols.get(p.payoutToken.toLowerCase()) ?? p.payoutToken);
+  return {
+    payoutId: p.id,
+    for: p.source ? `${p.source.kind} ${p.source.id}` : null,
+    paidIn: symbol,
+    amount: usdg(p.amount),
+    status: p.status,
+    received: p.amountOut === null ? null : isUsdg ? usdg(p.amountOut) : stock(p.amountOut, symbol),
+    paidAt: iso(p.paidAt),
+    paidTransaction: p.paidTx,
+    createdAt: iso(p.createdAt),
+    tokenSwitchFrom: p.status === "Pending" ? iso(p.canChangeTokenAt) : null,
+    attempts: p.deferredCount,
+    lastReason: p.lastDeferredReason,
+  };
+}
+
 function listingSummary(l: Listing) {
   return {
     id: l.id,
@@ -93,11 +128,18 @@ export function registerTools(server: McpServer, w2o: Work2own): void {
     return w2o.api<Token[]>("/tokens");
   }
 
-  /** Resolves "USDG" or a stock symbol and checks it is available to this wallet for the given amount. */
-  async function payoutToken(symbol: string, amount: bigint): Promise<{ address: Address; label: string; expected: string }> {
+  /**
+   * Resolves "USDG" or a stock symbol and checks it is available to this wallet for the given amount. Stock tokens
+   * need the payout country declared first (set_country), as in the app. `minOut` is the protected minimum right now.
+   */
+  async function payoutToken(symbol: string, amount: bigint): Promise<{ address: Address; label: string; expected: string; minOut: bigint | null }> {
     const s = symbol.trim().toUpperCase();
-    if (s === "USDG") return { address: USDG_PAYOUT, label: "USDG", expected: usdg(amount) };
+    if (s === "USDG") return { address: USDG_PAYOUT, label: "USDG", expected: usdg(amount), minOut: 0n };
     const me = w2o.requireAccount().address;
+    const profile = await w2o.api<{ country: string | null }>("/profile", { auth: true });
+    if (profile.country === null) {
+      throw new W2oError("declare the payout country first with set_country (the country of the person or business running this agent)");
+    }
     const quote = await w2o.api<Quote>(`/quote?amount=${amount}&worker=${me}`);
     const t = quote.tokens.find((x) => (x.symbol ?? "").toUpperCase() === s);
     if (!t) throw new W2oError(`${s} is not a Work2own payout token; call list_payout_tokens`);
@@ -106,17 +148,24 @@ export function registerTools(server: McpServer, w2o: Work2own): void {
       address: getAddress(t.address),
       label: s,
       expected: t.expectedOut ? `about ${stock(t.expectedOut, s)}` : s,
+      minOut: t.minOut === null ? null : BigInt(t.minOut),
     };
   }
 
-  /** Turns USDG base units and payout token addresses in an API answer into readable values. */
-  async function readable<T>(value: T): Promise<T> {
+  /** Token address (lowercase) to symbol; empty when the token list cannot be read. */
+  async function symbolMap(): Promise<Map<string, string>> {
     const symbols = new Map<string, string>();
     try {
       for (const t of await tokens()) symbols.set(t.address.toLowerCase(), t.symbol ?? t.address);
     } catch {
       // token names are a convenience; addresses stay as they are
     }
+    return symbols;
+  }
+
+  /** Turns USDG base units and payout token addresses in an API answer into readable values. */
+  async function readable<T>(value: T): Promise<T> {
+    const symbols = await symbolMap();
     const walk = (v: unknown, key: string | null): unknown => {
       if (Array.isArray(v)) return v.map((x) => walk(x, null));
       if (v !== null && typeof v === "object") return Object.fromEntries(Object.entries(v).map(([k, x]) => [k, walk(x, k)]));
@@ -601,6 +650,115 @@ export function registerTools(server: McpServer, w2o: Work2own): void {
       const { hash } = await w2o.api<{ hash: Hex }>("/proofs", { method: "POST", body: { content }, auth: true });
       const receipt = await w2o.escrowWrite("rejectGig", [BigInt(gigId), hash]);
       return { rejected: true, gigId, disputeOpened: true, transaction: receipt.transactionHash };
+    },
+  );
+
+  tool(
+    "close_gig_post",
+    "Closes an open gig post of this agent without hiring; every open application is declined. Nothing was funded, so nothing moves.",
+    { postId: z.number().int().positive() },
+    async ({ postId }) => {
+      await w2o.api<Json>(`/listings/${postId}/close`, { method: "POST", body: {}, auth: true });
+      return { closed: true, postId };
+    },
+  );
+
+  tool(
+    "cancel_gig",
+    "Cancels a gig this agent funded when the worker did not deliver before the deadline; the full budget comes back (the fee does not).",
+    { gigId: z.number().int().positive() },
+    async ({ gigId }) => {
+      const receipt = await w2o.escrowWrite("cancelGig", [BigInt(gigId)]);
+      return { cancelled: true, gigId, transaction: receipt.transactionHash, next: "if the refund was deferred, call withdraw_refund" };
+    },
+  );
+
+  tool(
+    "withdraw_application",
+    "Withdraws this agent's application to an open gig post. It can apply again later while the post is open.",
+    { postId: z.number().int().positive() },
+    async ({ postId }) => {
+      await w2o.api<Json>(`/listings/${postId}/withdraw`, { method: "POST", body: {}, auth: true });
+      return { withdrawn: true, postId };
+    },
+  );
+
+  // ---- Payouts --------------------------------------------------------------------------------------
+
+  tool(
+    "list_my_payouts",
+    "This agent's payouts: what each quest or gig paid and in which token, and which are still pending, with the last reason and when the token can be switched.",
+    { pendingOnly: z.boolean().optional() },
+    async ({ pendingOnly }) => {
+      const me = w2o.requireAccount().address;
+      const [account, symbols] = await Promise.all([w2o.api<{ payouts: Payout[] }>(`/account/${me}`, { auth: true }), symbolMap()]);
+      const list = account.payouts.filter((p) => !pendingOnly || p.status === "Pending");
+      return { count: list.length, payouts: list.map((p) => payoutSummary(p, symbols)) };
+    },
+  );
+
+  /** A pending payout of this agent, or an error saying why it cannot be acted on. */
+  async function myPendingPayout(payoutId: number): Promise<Payout> {
+    const me = w2o.requireAccount().address.toLowerCase();
+    const p = await w2o.api<Payout>(`/payouts/${payoutId}`);
+    if (p.worker.toLowerCase() !== me) throw new W2oError("this payout belongs to another wallet");
+    if (p.status !== "Pending") throw new W2oError(`the payout is ${p.status}, not pending`);
+    return p;
+  }
+
+  function outcome(receipt: TransactionReceipt, payoutId: number, symbol: string) {
+    const r = w2o.payoutResult(receipt, payoutId);
+    if (r.paid) {
+      const received = r.amountOut === null ? null : symbol === "USDG" ? usdg(r.amountOut) : stock(r.amountOut, symbol);
+      return { paid: true, received, transaction: receipt.transactionHash };
+    }
+    return {
+      paid: false,
+      deferred: r.deferred,
+      transaction: receipt.transactionHash,
+      next: "the payout is still pending; list_my_payouts shows the reason once indexed, and the operator keeps retrying",
+    };
+  }
+
+  tool(
+    "retry_payout",
+    "Tries a pending payout of this agent again now, at a protected price. Stock payouts wait while the price feed is stale, for example when the stock market is closed.",
+    { payoutId: z.number().int().positive() },
+    async ({ payoutId }) => {
+      const p = await myPendingPayout(payoutId);
+      const isUsdg = p.payoutToken.toLowerCase() === USDG_PAYOUT.toLowerCase();
+      let minOut = 0n;
+      let symbol = "USDG";
+      if (!isUsdg) {
+        const quote = await w2o.api<Quote>(`/quote?amount=${p.amount}&worker=${p.worker}`);
+        const t = quote.tokens.find((x) => x.address.toLowerCase() === p.payoutToken.toLowerCase());
+        symbol = t?.symbol ?? p.payoutToken;
+        if (!t || !t.available || t.minOut === null) {
+          throw new W2oError(
+            `the ${symbol} swap cannot run right now (${t?.reason ?? "token not found"}); the operator retries it, and the token can be switched from ${iso(p.canChangeTokenAt)}`,
+          );
+        }
+        minOut = BigInt(t.minOut);
+      }
+      const receipt = await w2o.escrowWrite("retryPayout", [BigInt(payoutId), minOut]);
+      return { payoutId, ...outcome(receipt, payoutId, symbol) };
+    },
+  );
+
+  tool(
+    "change_payout_token",
+    "Switches a payout of this agent that has been pending for 3 days to another stock token or to USDG, and pays it at once if the new choice can run.",
+    { payoutId: z.number().int().positive(), payoutToken: z.string().describe("USDG or a stock symbol such as NVDA") },
+    async ({ payoutId, payoutToken: symbol }) => {
+      const p = await myPendingPayout(payoutId);
+      if (Math.floor(Date.now() / 1000) < p.canChangeTokenAt) {
+        throw new W2oError(`the token can be switched from ${iso(p.canChangeTokenAt)}; until then use retry_payout`);
+      }
+      const token = await payoutToken(symbol, BigInt(p.amount));
+      if (token.address.toLowerCase() === p.payoutToken.toLowerCase()) throw new W2oError("the payout already uses that token; use retry_payout");
+      if (token.minOut === null) throw new W2oError(`${token.label} has no protected price right now; try another token or USDG`);
+      const receipt = await w2o.escrowWrite("changePayoutToken", [BigInt(payoutId), token.address, token.minOut]);
+      return { payoutId, switchedTo: token.label, ...outcome(receipt, payoutId, token.label) };
     },
   );
 }

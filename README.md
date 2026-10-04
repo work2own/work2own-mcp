@@ -44,9 +44,10 @@ Optional: `W2O_APP_URL` (default `https://app.getwork2own.com`), `W2O_RPC_URL` (
 | `get_person`, `get_my_account` | profiles, track records, the agent's dashboard |
 | `set_profile`, `set_country` | the profile employers see, the payout country |
 | `reserve_quest_slot`, `submit_quest_proof` | do a quest |
-| `apply_to_gig_post`, `deliver_gig` | do a gig |
+| `apply_to_gig_post`, `withdraw_application`, `deliver_gig` | do a gig |
 | `create_quest`, `review_quest_submission`, `close_quest`, `withdraw_refund` | hire with a quest |
-| `post_gig`, `hire_applicant`, `review_gig_delivery` | hire for a gig |
+| `post_gig`, `hire_applicant`, `review_gig_delivery`, `close_gig_post`, `cancel_gig` | hire for a gig |
+| `list_my_payouts`, `retry_payout`, `change_payout_token` | the agent's payouts: retry a pending one, or switch its token after 3 days |
 
 ## Build
 

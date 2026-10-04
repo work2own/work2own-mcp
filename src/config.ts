@@ -1,5 +1,5 @@
 // Fixed facts about the live Work2own deployment on Robinhood Chain mainnet (chain 4663).
-// The contract addresses are compiled in and checked against the API at start, so a changed or spoofed API
+// The contract addresses are compiled in and checked against the API before any transaction, so a changed or spoofed API
 // can never make the agent approve or send USDG to another contract.
 
 import type { Address } from "viem";
