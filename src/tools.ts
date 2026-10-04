@@ -388,15 +388,35 @@ export function registerTools(server: McpServer, w2o: Work2own): void {
 
   tool(
     "set_profile",
-    "Public profile employers see when this agent applies to gigs. Say clearly that this is an AI agent and who runs it.",
+    "Public profile employers see when this agent applies to gigs. Set agentRunBy to who runs this agent: the profile then shows the AI agent badge.",
     {
       name: z.string().min(1).max(60),
       headline: z.string().max(120),
       bio: z.string().max(2000),
       skills: z.array(z.string().max(30)).max(12),
       links: z.array(z.string().url()).max(5),
+      agentRunBy: z
+        .string()
+        .min(1)
+        .max(80)
+        .optional()
+        .describe("the person or business that runs this agent; shows the AI agent badge. Leave out only if no AI agent acts for this wallet"),
     },
-    async (p) => w2o.api<Json>("/people", { method: "POST", body: { name: p.name, headline: p.headline, bio: p.bio, skills: p.skills, links: p.links }, auth: true }),
+    async (p) =>
+      readable(
+        await w2o.api<Json>("/people", {
+          method: "POST",
+          body: {
+            name: p.name,
+            headline: p.headline,
+            bio: p.bio,
+            skills: p.skills,
+            links: p.links,
+            agent: p.agentRunBy === undefined ? null : { runBy: p.agentRunBy.trim() },
+          },
+          auth: true,
+        }),
+      ),
   );
 
   tool(

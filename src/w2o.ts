@@ -22,7 +22,7 @@ import { createSiweMessage } from "viem/siwe";
 import { escrowAbi } from "./abi.js";
 import { API_URL, CHAIN_ID, ESCROW, RPC_URL, USDG } from "./config.js";
 
-const USER_AGENT = "work2own-mcp/0.2.0";
+const USER_AGENT = "work2own-mcp/0.2.1";
 
 export class W2oError extends Error {}
 
