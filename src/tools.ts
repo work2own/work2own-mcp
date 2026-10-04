@@ -31,7 +31,13 @@ type Campaign = {
 type Claim = { worker: string; status: string; payoutToken: string; reservationEndsAt: number; submittedAt: number | null; reviewEndsAt: number | null; proof: unknown; payoutId: number | null };
 type Listing = { id: number; employer: string; employerName: string | null; title: string; description: string; links: string[]; budget: string; deliveryDays: number; status: string; applicants: number; createdAt: number; gigId: number | null };
 
-const usdg = (units: string | bigint) => `${Number(formatUnits(BigInt(units), USDG_DECIMALS)).toFixed(2)} USDG`;
+/** Exact USDG amount with at least 2 decimals, e.g. "0.10 USDG" or "0.002 USDG". */
+const usdg = (units: string | bigint) => {
+  const [whole, frac = ""] = formatUnits(BigInt(units), USDG_DECIMALS).split(".");
+  return `${whole}.${frac.padEnd(2, "0")} USDG`;
+};
+/** Fields of API answers that hold USDG base units. */
+const USDG_FIELDS = new Set(["rewardPerSlot", "budget", "fee", "earnedUsdg", "workerAmount", "employerRefund"]);
 const toUnits = (amount: string) => {
   if (!/^\d+(\.\d{1,6})?$/.test(amount.trim())) throw new W2oError("amounts are USDG with up to 6 decimals, for example 10 or 2.5");
   const units = parseUnits(amount.trim(), USDG_DECIMALS);
@@ -101,6 +107,28 @@ export function registerTools(server: McpServer, w2o: Work2own): void {
       label: s,
       expected: t.expectedOut ? `about ${stock(t.expectedOut, s)}` : s,
     };
+  }
+
+  /** Turns USDG base units and payout token addresses in an API answer into readable values. */
+  async function readable<T>(value: T): Promise<T> {
+    const symbols = new Map<string, string>();
+    try {
+      for (const t of await tokens()) symbols.set(t.address.toLowerCase(), t.symbol ?? t.address);
+    } catch {
+      // token names are a convenience; addresses stay as they are
+    }
+    const walk = (v: unknown, key: string | null): unknown => {
+      if (Array.isArray(v)) return v.map((x) => walk(x, null));
+      if (v !== null && typeof v === "object") return Object.fromEntries(Object.entries(v).map(([k, x]) => [k, walk(x, k)]));
+      if (typeof v === "string" && key !== null) {
+        if (USDG_FIELDS.has(key) && /^\d+$/.test(v)) return usdg(v);
+        if ((key === "payoutToken" || key === "paidIn") && isAddress(v)) {
+          return v.toLowerCase() === USDG_PAYOUT.toLowerCase() ? "USDG" : (symbols.get(v.toLowerCase()) ?? v);
+        }
+      }
+      return v;
+    };
+    return walk(value, null) as T;
   }
 
   async function config(): Promise<Config> {
@@ -174,7 +202,7 @@ export function registerTools(server: McpServer, w2o: Work2own): void {
       const c = await w2o.api<Campaign & { claims: Claim[] }>(`/campaigns/${questId}`, { auth: w2o.address !== null });
       const me = w2o.address?.toLowerCase();
       const mine = c.claims.find((x) => x.worker === me) ?? null;
-      return {
+      return readable({
         ...questSummary(c),
         description: c.meta?.description ?? null,
         links: c.meta?.links ?? [],
@@ -204,7 +232,7 @@ export function registerTools(server: McpServer, w2o: Work2own): void {
                 .filter((x) => x.status === "Submitted")
                 .map((x) => ({ worker: x.worker, submittedAt: iso(x.submittedAt), autoPaidAt: iso(x.reviewEndsAt), proof: x.proof }))
             : undefined,
-      };
+      });
     },
   );
 
@@ -230,7 +258,7 @@ export function registerTools(server: McpServer, w2o: Work2own): void {
     { postId: z.number().int().positive() },
     async ({ postId }) => {
       const l = await w2o.api<Listing & { applications: unknown; myApplication: unknown }>(`/listings/${postId}`, { auth: w2o.address !== null });
-      return { ...listingSummary(l), description: l.description, links: l.links, gigId: l.gigId, applications: l.applications, myApplication: l.myApplication };
+      return readable({ ...listingSummary(l), description: l.description, links: l.links, gigId: l.gigId, applications: l.applications, myApplication: l.myApplication });
     },
   );
 
@@ -239,8 +267,8 @@ export function registerTools(server: McpServer, w2o: Work2own): void {
     "A funded gig: status, deadline, the brief, and the delivery (visible to its employer and worker).",
     { gigId: z.number().int().positive() },
     async ({ gigId }) => {
-      const g = await w2o.api<Json>(`/gigs/${gigId}`, { auth: w2o.address !== null });
-      return { ...g, budget: usdg(g.budget as string), deadline: iso(g.deadline as number), url: `${APP_URL}/#/g/${gigId}` };
+      const g = await readable(await w2o.api<Json>(`/gigs/${gigId}`, { auth: w2o.address !== null }));
+      return { ...g, deadline: iso(g.deadline as number), url: `${APP_URL}/#/g/${gigId}` };
     },
   );
 
@@ -292,7 +320,7 @@ export function registerTools(server: McpServer, w2o: Work2own): void {
     { address: z.string() },
     async ({ address }) => {
       if (!isAddress(address)) throw new W2oError("not an address");
-      return w2o.api<Json>(`/people/${address.toLowerCase()}`);
+      return readable(await w2o.api<Json>(`/people/${address.toLowerCase()}`));
     },
   );
 
@@ -303,7 +331,7 @@ export function registerTools(server: McpServer, w2o: Work2own): void {
     async () => {
       const me = w2o.requireAccount().address;
       const [account, balance] = await Promise.all([w2o.api<Json>(`/account/${me}`, { auth: true }), w2o.usdgBalance(me)]);
-      return { wallet: me, usdgBalance: usdg(balance), ...account };
+      return { wallet: me, usdgBalance: usdg(balance), ...(await readable(account)) };
     },
   );
 
