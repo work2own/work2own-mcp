@@ -38,6 +38,13 @@ const toUnits = (amount: string) => {
   if (units <= 0n) throw new W2oError("the amount must be above zero");
   return units;
 };
+/** Stock amount with at most 6 decimals, e.g. "0.055187 NVDA". */
+const stock = (units: string | bigint, symbol: string | null) => {
+  const [whole, frac = ""] = formatUnits(BigInt(units), STOCK_DECIMALS).split(".");
+  const cut = frac.slice(0, 6).replace(/0+$/, "");
+  return `${cut ? `${whole}.${cut}` : whole} ${symbol ?? ""}`.trim();
+};
+const tokenName = (name: string | null) => (name ?? "").replace(" • Robinhood Token", "");
 const iso = (t: number | null) => (t === null ? null : new Date(t * 1000).toISOString());
 const reply = (value: unknown) => ({ content: [{ type: "text" as const, text: typeof value === "string" ? value : JSON.stringify(value, null, 2) }] });
 const failure = (error: unknown) => ({ content: [{ type: "text" as const, text: `Error: ${errorText(error)}` }], isError: true });
@@ -92,7 +99,7 @@ export function registerTools(server: McpServer, w2o: Work2own): void {
     return {
       address: getAddress(t.address),
       label: s,
-      expected: t.expectedOut ? `about ${formatUnits(BigInt(t.expectedOut), STOCK_DECIMALS)} ${s}` : s,
+      expected: t.expectedOut ? `about ${stock(t.expectedOut, s)}` : s,
     };
   }
 
@@ -269,8 +276,8 @@ export function registerTools(server: McpServer, w2o: Work2own): void {
           { symbol: "USDG", receive: usdg(units), available: true },
           ...q.tokens.map((t) => ({
             symbol: t.symbol,
-            name: t.name,
-            receive: t.expectedOut ? `about ${formatUnits(BigInt(t.expectedOut), STOCK_DECIMALS)} ${t.symbol}` : null,
+            name: tokenName(t.name),
+            receive: t.expectedOut ? `about ${stock(t.expectedOut, t.symbol)}` : null,
             available: t.available,
             reason: t.reason,
           })),
@@ -329,6 +336,7 @@ export function registerTools(server: McpServer, w2o: Work2own): void {
     "Reserves a slot in a quest and fixes the payout token. The agent then has 24 hours to submit proof.",
     { questId: z.number().int().positive(), payoutToken: z.string().describe("USDG or a stock symbol such as NVDA") },
     async ({ questId, payoutToken: symbol }) => {
+      w2o.requireAccount();
       const c = await w2o.api<Campaign>(`/campaigns/${questId}`);
       if (c.state !== "open") throw new W2oError(`this quest is ${c.state}`);
       const token = await payoutToken(symbol, BigInt(c.rewardPerSlot));
