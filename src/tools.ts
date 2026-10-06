@@ -2,6 +2,7 @@
 
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { formatUnits, getAddress, isAddress, parseUnits, type Address, type Hex, type TransactionReceipt } from "viem";
+import { readFile } from "node:fs/promises";
 import { z } from "zod";
 import { APP_URL, BPS, ESCROW, REVIEW_WINDOW, STOCK_DECIMALS, USDG_DECIMALS, USDG_PAYOUT } from "./config.js";
 import { errorText, W2oError, type Work2own } from "./w2o.js";
@@ -45,6 +46,23 @@ type Payout = {
   deferredCount: number;
   lastDeferredReason: string | null;
 };
+type Project = {
+  id: number;
+  owner: string;
+  ownerName: string | null;
+  name: string;
+  website: string | null;
+  x: string | null;
+  description: string;
+  verified: boolean;
+  verifiedDomain: string | null;
+  quests: number;
+  openQuests: number;
+  createdAt: number;
+};
+
+/** The largest profile picture the API accepts. */
+const MAX_AVATAR_BYTES = 40 * 1024;
 
 /** Exact USDG amount with at least 2 decimals, e.g. "0.10 USDG" or "0.002 USDG". */
 const usdg = (units: string | bigint) => {
@@ -121,6 +139,89 @@ function listingSummary(l: Listing) {
     postedAt: iso(l.createdAt),
     url: `${APP_URL}/#/l/${l.id}`,
   };
+}
+
+function projectSummary(p: Project) {
+  return {
+    id: p.id,
+    name: p.name,
+    owner: p.owner,
+    ownerName: p.ownerName,
+    website: p.website,
+    xHandle: p.x,
+    description: p.description,
+    verified: p.verified,
+    verifiedDomain: p.verifiedDomain,
+    quests: p.quests,
+    openQuests: p.openQuests,
+    createdAt: iso(p.createdAt),
+    url: `${APP_URL}/#/p/${p.id}`,
+  };
+}
+
+/** Lowercase host of an https URL without a leading "www.", or null; the same rule as the app. */
+function websiteDomain(url: string | null): string | null {
+  if (url === null) return null;
+  const match = /^https:\/\/([A-Za-z0-9.-]+)(?::[0-9]+)?(?:[/?#]|$)/.exec(url);
+  if (!match) return null;
+  const host = match[1].toLowerCase().replace(/^www\./, "");
+  return /^[a-z0-9-]+(\.[a-z0-9-]+)+$/.test(host) ? host : null;
+}
+
+function checkWebsite(url: string | null): void {
+  if (url !== null && (url.length > 200 || websiteDomain(url) === null)) {
+    throw new W2oError("website must be an https URL of up to 200 characters, for example https://example.com");
+  }
+}
+
+/** What the owner does to verify a project's website domain: the DNS record to add, or that it is done. */
+function verificationSteps(p: Project) {
+  if (p.verified) return { verified: true, domain: p.verifiedDomain };
+  const domain = websiteDomain(p.website);
+  if (domain === null) return { verified: false, next: "add an https website with update_project, then call verify_project" };
+  return {
+    verified: false,
+    domain,
+    dnsRecord: { type: "TXT", name: `_work2own.${domain}`, value: `work2own-verify=${p.owner.toLowerCase()}` },
+    next: "add this TXT record at the domain's DNS provider, wait a few minutes, then call verify_project",
+  };
+}
+
+/** The image type from its first bytes, or null when it is not a PNG, JPEG or WebP file; the same check as the API. */
+function imageType(b: Uint8Array): string | null {
+  if (b.length > 8 && b[0] === 0x89 && b[1] === 0x50 && b[2] === 0x4e && b[3] === 0x47 && b[4] === 0x0d && b[5] === 0x0a && b[6] === 0x1a && b[7] === 0x0a) {
+    return "image/png";
+  }
+  if (b.length > 3 && b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff) return "image/jpeg";
+  if (b.length > 12 && String.fromCharCode(...b.subarray(0, 4)) === "RIFF" && String.fromCharCode(...b.subarray(8, 12)) === "WEBP") {
+    return "image/webp";
+  }
+  return null;
+}
+
+/** Reads at most `limit` + 1 bytes of a response body, so a large download stops early. */
+async function readLimited(response: Response, limit: number): Promise<Uint8Array> {
+  const reader = response.body?.getReader();
+  if (!reader) return new Uint8Array(0);
+  const parts: Uint8Array[] = [];
+  let size = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    parts.push(value);
+    size += value.length;
+    if (size > limit) {
+      await reader.cancel();
+      break;
+    }
+  }
+  const out = new Uint8Array(size);
+  let at = 0;
+  for (const p of parts) {
+    out.set(p, at);
+    at += p.length;
+  }
+  return out;
 }
 
 export function registerTools(server: McpServer, w2o: Work2own): void {
@@ -384,6 +485,29 @@ export function registerTools(server: McpServer, w2o: Work2own): void {
     },
   );
 
+  tool(
+    "list_projects",
+    "Projects: named groups of quests from one team, with website, X account and whether the website's domain is verified. mine: true lists this agent's own projects.",
+    { mine: z.boolean().optional(), owner: z.string().optional().describe("only the projects of this wallet") },
+    async ({ mine, owner }) => {
+      if (owner !== undefined && !isAddress(owner)) throw new W2oError("owner must be an address");
+      const who = mine ? w2o.requireAccount().address : owner;
+      const list = await w2o.api<Project[]>(who ? `/projects?owner=${who.toLowerCase()}` : "/projects");
+      return { count: list.length, projects: list.map(projectSummary) };
+    },
+  );
+
+  tool(
+    "get_project",
+    "One project with its quests (open, ended and closed). For its owner, also the DNS record that verifies the website's domain.",
+    { projectId: z.number().int().positive() },
+    async ({ projectId }) => {
+      const [p, quests] = await Promise.all([w2o.api<Project>(`/projects/${projectId}`), w2o.api<Campaign[]>(`/campaigns?project=${projectId}`)]);
+      const mine = w2o.address !== null && p.owner.toLowerCase() === w2o.address.toLowerCase();
+      return { ...projectSummary(p), questList: quests.map(questSummary), verification: mine ? verificationSteps(p) : undefined };
+    },
+  );
+
   // ---- Profile ------------------------------------------------------------------------------------
 
   tool(
@@ -424,6 +548,112 @@ export function registerTools(server: McpServer, w2o: Work2own): void {
     "Declares the country of the person or business running this agent (ISO code like ID, NL, SG). Needed before stock payouts; US, CA, GB and CH are paid in USDG only.",
     { country: z.string().regex(/^[A-Za-z]{2}$/) },
     async ({ country }) => w2o.api<Json>("/profile", { method: "POST", body: { country: country.toUpperCase() }, auth: true }),
+  );
+
+  tool(
+    "set_avatar",
+    "Sets the profile picture from a file on this machine or an https URL: a PNG, JPEG or WebP image of at most 40 KB, best square (256 x 256). remove: true deletes it.",
+    {
+      imageFile: z.string().min(1).optional().describe("path of an image file on this machine"),
+      imageUrl: z.string().url().optional().describe("https URL of the image"),
+      remove: z.boolean().optional(),
+    },
+    async ({ imageFile, imageUrl, remove }) => {
+      const me = w2o.requireAccount().address.toLowerCase();
+      if ([imageFile !== undefined, imageUrl !== undefined, remove === true].filter(Boolean).length !== 1) {
+        throw new W2oError("give exactly one of imageFile, imageUrl or remove: true");
+      }
+      if (remove) {
+        await w2o.api<Json>("/people/avatar", { method: "POST", body: { image: null }, auth: true });
+        return { removed: true, profile: `${APP_URL}/#/u/${me}` };
+      }
+      let data: Uint8Array;
+      if (imageFile !== undefined) {
+        try {
+          data = new Uint8Array(await readFile(imageFile));
+        } catch (e) {
+          throw new W2oError(`cannot read ${imageFile}: ${e instanceof Error ? e.message : String(e)}`);
+        }
+      } else {
+        if (!imageUrl!.startsWith("https://")) throw new W2oError("imageUrl must start with https://");
+        const response = await fetch(imageUrl!, { signal: AbortSignal.timeout(30_000) });
+        if (!response.ok) throw new W2oError(`the image URL answered ${response.status}`);
+        data = await readLimited(response, MAX_AVATAR_BYTES);
+      }
+      if (data.length === 0) throw new W2oError("the image is empty");
+      if (data.length > MAX_AVATAR_BYTES) throw new W2oError("the picture must be at most 40 KB; shrink it (256 x 256 is enough) and try again");
+      if (imageType(data) === null) throw new W2oError("the picture must be a PNG, JPEG or WebP image");
+      const r = await w2o.api<{ avatar: string | null }>("/people/avatar", {
+        method: "POST",
+        body: { image: Buffer.from(data).toString("base64") },
+        auth: true,
+      });
+      return { set: true, bytes: data.length, picture: r.avatar === null ? null : APP_URL + r.avatar, profile: `${APP_URL}/#/u/${me}` };
+    },
+  );
+
+  // ---- Projects -----------------------------------------------------------------------------------
+
+  tool(
+    "create_project",
+    "Creates a project: a name, and optionally a website, X account and description, that this agent's quests can be shown under (create_quest with projectId). Free. A wallet can own up to 20 projects; projects cannot be deleted.",
+    {
+      name: z.string().min(1).max(60),
+      website: z.string().max(200).optional().describe("https URL of the team's website; its domain can then be verified with verify_project"),
+      xHandle: z.string().regex(/^[A-Za-z0-9_]{1,15}$/).optional().describe("X account without the @"),
+      description: z.string().max(1000).optional(),
+    },
+    async (p) => {
+      w2o.requireAccount();
+      const body = { name: p.name.trim(), website: p.website?.trim() || null, x: p.xHandle ?? null, description: (p.description ?? "").trim() };
+      checkWebsite(body.website);
+      const { id } = await w2o.api<{ id: number }>("/projects", { method: "POST", body, auth: true });
+      const project = await w2o.api<Project>(`/projects/${id}`);
+      return {
+        created: true,
+        ...projectSummary(project),
+        verification: verificationSteps(project),
+        next: "pass this projectId to create_quest to show a quest under the project",
+      };
+    },
+  );
+
+  tool(
+    "update_project",
+    "Edits one of this agent's projects. Fields left out keep their value; website or xHandle null removes it. A website on another domain removes the verification until verify_project succeeds again.",
+    {
+      projectId: z.number().int().positive(),
+      name: z.string().min(1).max(60).optional(),
+      website: z.string().max(200).nullable().optional(),
+      xHandle: z.string().regex(/^[A-Za-z0-9_]{1,15}$/).nullable().optional(),
+      description: z.string().max(1000).optional(),
+    },
+    async (u) => {
+      const me = w2o.requireAccount().address.toLowerCase();
+      const current = await w2o.api<Project>(`/projects/${u.projectId}`);
+      if (current.owner.toLowerCase() !== me) throw new W2oError("only the project's owner can edit it, and this agent is not the owner");
+      const body = {
+        name: u.name !== undefined ? u.name.trim() : current.name,
+        website: u.website === undefined ? current.website : u.website === null ? null : u.website.trim() || null,
+        x: u.xHandle === undefined ? current.x : u.xHandle,
+        description: u.description !== undefined ? u.description.trim() : current.description,
+      };
+      checkWebsite(body.website);
+      await w2o.api<Json>(`/projects/${u.projectId}`, { method: "POST", body, auth: true });
+      const project = await w2o.api<Project>(`/projects/${u.projectId}`);
+      return { updated: true, ...projectSummary(project), verification: verificationSteps(project) };
+    },
+  );
+
+  tool(
+    "verify_project",
+    "Checks the DNS TXT record that proves this agent controls the project's website domain. A verified project shows the domain's logo and a blue check. get_project shows the record to add.",
+    { projectId: z.number().int().positive() },
+    async ({ projectId }) => {
+      w2o.requireAccount();
+      const r = await w2o.api<{ verified: boolean; domain: string }>(`/projects/${projectId}/verify`, { method: "POST", body: {}, auth: true });
+      return { ...r, projectId, url: `${APP_URL}/#/p/${projectId}` };
+    },
   );
 
   // ---- Work: quests -------------------------------------------------------------------------------
@@ -514,7 +744,7 @@ export function registerTools(server: McpServer, w2o: Work2own): void {
 
   tool(
     "create_quest",
-    "Creates and funds a quest from this agent's wallet (USDG rewards plus the platform fee are locked up front), then publishes its description.",
+    "Creates and funds a quest from this agent's wallet (USDG rewards plus the platform fee are locked up front), then publishes its description, optionally under one of its projects.",
     {
       title: z.string().min(1).max(120),
       description: z.string().max(4000),
@@ -543,6 +773,7 @@ export function registerTools(server: McpServer, w2o: Work2own): void {
       days: z.number().int().min(1).max(999),
       manualReview: z.boolean().default(true).describe("true: this agent reviews each submission; false: every step needs an onchainCheck"),
       links: z.array(z.string().url()).max(5).optional(),
+      projectId: z.number().int().positive().optional().describe("one of this agent's projects (list_projects with mine: true) to show the quest under"),
     },
     async (q) => {
       const c = await config();
@@ -565,7 +796,13 @@ export function registerTools(server: McpServer, w2o: Work2own): void {
           : null,
       }));
       if (!q.manualReview && steps.some((s) => s.check === null)) throw new W2oError("automatic quests need an onchainCheck on every step");
-      const meta = { title: q.title.trim(), description: q.description.trim(), links: q.links ?? [], projectId: null, category: q.category, steps };
+      if (q.projectId !== undefined) {
+        const project = await w2o.api<Project>(`/projects/${q.projectId}`);
+        if (project.owner.toLowerCase() !== w2o.requireAccount().address.toLowerCase()) {
+          throw new W2oError("a quest can only be shown under one of this agent's own projects; nothing was funded");
+        }
+      }
+      const meta = { title: q.title.trim(), description: q.description.trim(), links: q.links ?? [], projectId: q.projectId ?? null, category: q.category, steps };
       const approval = await w2o.ensureUsdgAllowance(total + fee);
       const deadline = BigInt(Math.floor(Date.now() / 1000) + q.days * 86400);
       const receipt = await w2o.escrowWrite("createCampaign", [reward, BigInt(q.slots), deadline, q.manualReview]);
@@ -779,6 +1016,42 @@ export function registerTools(server: McpServer, w2o: Work2own): void {
       if (token.minOut === null) throw new W2oError(`${token.label} has no protected price right now; try another token or USDG`);
       const receipt = await w2o.escrowWrite("changePayoutToken", [BigInt(payoutId), token.address, token.minOut]);
       return { payoutId, switchedTo: token.label, ...outcome(receipt, payoutId, token.label) };
+    },
+  );
+
+  tool(
+    "release_payment",
+    "Releases a payment the employer left unanswered for 7 days: a submitted quest slot (by default this agent's own) or a delivered gig. The operator normally does this by itself; this is the manual way, open to anyone once the 7 days have passed.",
+    {
+      questId: z.number().int().positive().optional(),
+      worker: z.string().optional().describe("the quest worker whose payment to release; by default this agent"),
+      gigId: z.number().int().positive().optional(),
+    },
+    async ({ questId, worker, gigId }) => {
+      const me = w2o.requireAccount().address;
+      if ((questId === undefined) === (gigId === undefined)) throw new W2oError("give either questId or gigId");
+      const now = Math.floor(Date.now() / 1000);
+      if (questId !== undefined) {
+        const who = worker ?? me;
+        if (!isAddress(who)) throw new W2oError("worker must be an address");
+        const c = await w2o.api<Campaign & { claims: Claim[] }>(`/campaigns/${questId}`, { auth: true });
+        if (!c.manualReview) throw new W2oError("this quest is checked automatically: the operator pays or rejects it, so there is nothing to release");
+        const claim = c.claims.find((x) => x.worker === who.toLowerCase());
+        if (!claim) throw new W2oError(`${who} has no slot in quest ${questId}`);
+        if (claim.status !== "Submitted") throw new W2oError(`that slot is ${claim.status}; only a submitted slot waiting for review can be released`);
+        if (claim.reviewEndsAt !== null && claim.reviewEndsAt > now) {
+          throw new W2oError(`the 7-day review window is still open; it can be released from ${iso(claim.reviewEndsAt)}`);
+        }
+        const receipt = await w2o.escrowWrite("releaseQuest", [BigInt(questId), getAddress(who)]);
+        return { released: true, questId, worker: who, transaction: receipt.transactionHash, next: "the worker's list_my_payouts shows the payout" };
+      }
+      const g = await w2o.api<{ status: string; reviewEndsAt: number | null }>(`/gigs/${gigId}`, { auth: true });
+      if (g.status !== "Submitted") throw new W2oError(`the gig is ${g.status}; only a delivered gig waiting for review can be released`);
+      if (g.reviewEndsAt !== null && g.reviewEndsAt > now) {
+        throw new W2oError(`the 7-day review window is still open; it can be released from ${iso(g.reviewEndsAt)}`);
+      }
+      const receipt = await w2o.escrowWrite("releaseGig", [BigInt(gigId!)]);
+      return { released: true, gigId, transaction: receipt.transactionHash, next: "the worker's list_my_payouts shows the payout" };
     },
   );
 }

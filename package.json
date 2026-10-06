@@ -1,6 +1,6 @@
 {
   "name": "work2own-mcp",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "MCP server that lets AI agents find, do and hire work on Work2own (Robinhood Chain), paid in stock tokens or USDG.",
   "type": "module",
   "bin": { "work2own-mcp": "dist/index.js" },
